@@ -1,3 +1,4 @@
+from __future__ import annotations   # allow 3.10+ type-hint syntax on older Python
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -2693,6 +2694,14 @@ _PRODUCT_CLASS_MAP = {
 }
 _PRODUCT_CLASS_NORM = {_norm_name(k): v for k, v in _PRODUCT_CLASS_MAP.items()}
 
+# Internal / test entities to exclude from product, customer-outstanding & collection views
+_PRODUCT_EXCLUDE_CUSTOMERS = {
+    _norm_name(x) for x in [
+        "Spyne AI Inc", "Mr. joseg", "billing test",
+        "Protyay test 123", "Spyne Motors", "Mr. John Anderson",
+    ]
+}
+
 def derive_inr_rates(base_df) -> dict:
     """Build {CURRENCY: INR-per-unit} from the base sheet, where each row has
     `balance` (foreign-currency O/S) and `Outstanding` (its INR value)."""
@@ -2713,6 +2722,19 @@ def derive_inr_rates(base_df) -> dict:
     except Exception:
         pass
     return rates
+
+_ACTUAL_DATE_MONTHS = ["2026-05", "2026-06"]   # these use actual date; all else use −1 day
+
+def collection_month(lpd_series: pd.Series) -> pd.Series:
+    """Month a payment is attributed to: (last_payment_date − 1 day), EXCEPT
+    May & June 2026, which use the actual payment date (payments are not shifted
+    into or out of those months). Returns 'YYYY-MM' strings."""
+    lpd = pd.to_datetime(lpd_series, errors="coerce")
+    am = lpd.dt.to_period("M").astype(str)
+    sm = (lpd - pd.Timedelta(days=1)).dt.to_period("M").astype(str)
+    use_actual = am.isin(_ACTUAL_DATE_MONTHS) | sm.isin(_ACTUAL_DATE_MONTHS)
+    return am.where(use_actual, sm)
+
 
 def product_outstanding_inr(pdf: pd.DataFrame, rates: dict) -> pd.Series:
     """Convert each line's outstanding (os_amount = line_total_incl_tax for
@@ -2756,6 +2778,11 @@ def load_product_sheet() -> pd.DataFrame:
 
     df.columns = [str(c).strip() for c in df.columns]
 
+    # Drop internal / test entities (intercompany, QA rows) from all product views
+    if "customer_name" in df.columns and _PRODUCT_EXCLUDE_CUSTOMERS:
+        _excl = df["customer_name"].map(lambda n: _norm_name(n) in _PRODUCT_EXCLUDE_CUSTOMERS)
+        df = df[~_excl].copy()
+
     # ── Line-level outstanding ────────────────────────────────────────────────
     # NOTE: outstanding_amount is INVOICE-level and repeats on every line of the
     # same invoice, so summing it double-counts. The true product/line outstanding
@@ -2764,12 +2791,32 @@ def load_product_sheet() -> pd.DataFrame:
         return pd.to_numeric(df[col].astype(str).str.replace(",", "", regex=False),
                              errors="coerce").fillna(0) if col in df.columns else 0
     _line_amt = _num("line_total_incl_tax")
+    df["line_amt"] = _line_amt
     _status   = df["status"].astype(str).str.lower().str.strip() if "status" in df.columns else ""
     _open     = _status.isin(["overdue", "sent"]) if hasattr(_status, "isin") else False
     df["os_amount"] = _line_amt.where(_open, 0) if hasattr(_status, "isin") else _line_amt
     # keep the raw invoice-level value available but do not use it for sums
     if "outstanding_amount" in df.columns:
         df["outstanding_amount"] = _num("outstanding_amount")
+
+    # ── Collections (from last_payment_date + credits_applied) ────────────────
+    # Collection for a paid line = line_total_incl_tax − its pro-rata share of the
+    # invoice's credits_applied (credit notes are not cash). Only lines that carry
+    # a last_payment_date count, and the credit is apportioned across the invoice's
+    # lines by line-amount share so per-invoice credit is deducted exactly once.
+    _lpd = pd.to_datetime(df.get("last_payment_date"), errors="coerce", dayfirst=True)
+    df["last_payment_dt"] = _lpd
+    # Collection month: (last_payment_date − 1 day), except May/June use actual date
+    df["pay_month"] = collection_month(_lpd)
+    _credit = _num("credits_applied")
+    df["credits_applied"] = _credit
+    if "invoice_number" in df.columns:
+        _inv_ltsum = df.groupby("invoice_number")["line_amt"].transform("sum").replace(0, np.nan)
+        _inv_credit = df.assign(_c=_credit).groupby("invoice_number")["_c"].transform("first")
+        _credit_share = (_inv_credit * (df["line_amt"] / _inv_ltsum)).fillna(0)
+    else:
+        _credit_share = 0
+    df["collection_fc"] = (df["line_amt"] - _credit_share).clip(lower=0).where(_lpd.notna(), 0)
 
     # Classification
     df["Product Class"] = df.apply(
@@ -2800,6 +2847,81 @@ def load_product_sheet() -> pd.DataFrame:
         return "Green"
     df["RAG"] = df.apply(_rag, axis=1)
     return df
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_base_collections() -> pd.DataFrame:
+    """Monthly collections from the BASE sheet (the complete invoice master).
+    Collection per invoice = (total − balance − credits) × INR rate, bucketed by
+    the month of last_payment_date. Credits are pulled from the product sheet by
+    invoice number. Internal/test entities are excluded. Returns per-invoice rows
+    with: invoice_number, customer_name, ym (YYYY-MM), coll_inr.
+    """
+    try:
+        raw = fetch_gsheet(_FIXED_SHEET_URL)
+        _xl = pd.ExcelFile(BytesIO(raw))
+        # pick the invoice sheet (most invoice-like columns)
+        def _score(nm):
+            cols = " ".join(str(c).lower() for c in _xl.parse(nm, nrows=0).columns)
+            return sum(k in cols for k in ("invoice", "balance", "outstanding", "last_payment", "total"))
+        _tab = max(_xl.sheet_names, key=_score)
+        b = _xl.parse(_tab)
+    except Exception:
+        return pd.DataFrame()
+    b.columns = [str(c).strip() for c in b.columns]
+    need = {"total", "balance", "Outstanding", "last_payment_date", "currency_code", "invoice_number"}
+    if not need <= set(b.columns):
+        return pd.DataFrame()
+
+    b["cur"] = b["currency_code"].astype(str).str.upper().str.strip()
+    b["tot"] = pd.to_numeric(b["total"], errors="coerce").fillna(0)
+    b["bal"] = pd.to_numeric(b["balance"], errors="coerce").fillna(0)
+    b["out"] = pd.to_numeric(b["Outstanding"], errors="coerce").fillna(0)
+    b["lpd"] = pd.to_datetime(b["last_payment_date"], errors="coerce", dayfirst=True)
+
+    # INR rates implied by the base sheet
+    _bb = b[(b["bal"] > 0) & (b["out"] > 0)].copy()
+    rates = {"INR": 1.0}
+    if not _bb.empty:
+        _bb["_r"] = _bb["out"] / _bb["bal"]
+        for c, g in _bb.groupby("cur"):
+            rates[c] = float(g["_r"].median())
+
+    # Credits — use the base sheet's own "Credits Applied" column (per invoice)
+    _cred_col = next((c for c in b.columns if str(c).strip().lower() == "credits applied"), None)
+    if _cred_col:
+        b["credit"] = pd.to_numeric(b[_cred_col], errors="coerce").fillna(0)
+    else:
+        b["credit"] = 0
+
+    # Exclude internal/test entities
+    if "customer_name" in b.columns and _PRODUCT_EXCLUDE_CUSTOMERS:
+        b = b[~b["customer_name"].map(lambda n: _norm_name(n) in _PRODUCT_EXCLUDE_CUSTOMERS)].copy()
+
+    b = b[b["lpd"].notna()].copy()
+    b["coll_inr"] = ((b["tot"] - b["bal"] - b["credit"]).clip(lower=0)
+                     * b["cur"].map(rates).fillna(0))
+    _ent_col = next((c for c in b.columns if str(c).strip().lower()
+                     in ("enterprisesid", "enterprise id", "enterprise_id")), None)
+    b["ent"] = b[_ent_col].astype(str) if _ent_col else ""
+    b["pay_date"] = b["lpd"].dt.strftime("%d-%b-%Y")
+    b = b[b["coll_inr"] > 0].copy()
+
+    # Month attribution — INDEPENDENT PER MONTH:
+    #   • "rest" months (all except May/Jun 2026): value = (last_payment_date − 1 day)
+    #   • May-2026 & Jun-2026: value = ACTUAL last_payment_date
+    # A payment can land in a rest month via −1 AND in May/Jun via actual (e.g. a
+    # 1-May payment shows in Apr via −1 and in May via actual), so each month equals
+    # its own rule exactly — matching how the numbers are reported.
+    _cols = ["invoice_number", "customer_name", "ent", "cur", "pay_date", "coll_inr"]
+    b["_m1"] = (b["lpd"] - pd.Timedelta(days=1)).dt.to_period("M").astype(str)
+    b["_ma"] = b["lpd"].dt.to_period("M").astype(str)
+    _rest = b[~b["_m1"].isin(_ACTUAL_DATE_MONTHS)].copy()
+    _rest["ym"] = _rest["_m1"]
+    _actm = b[b["_ma"].isin(_ACTUAL_DATE_MONTHS)].copy()
+    _actm["ym"] = _actm["_ma"]
+    out = pd.concat([_rest[_cols + ["ym"]], _actm[_cols + ["ym"]]], ignore_index=True)
+    return out
 
 
 @st.cache_data(ttl=120, show_spinner=False)
@@ -3300,6 +3422,7 @@ with _refresh_col:
             fetch_gsheet.clear()
             load_autopay_customers.clear()
             load_product_sheet.clear()
+            load_base_collections.clear()
             st.session_state.pop("_gs_file_bytes", None)
             st.session_state["_gs_last_refresh"] = None
             st.rerun()
@@ -3617,6 +3740,7 @@ _TAB_DEFS = [
     ("tab_reasons",   "📝 Reasons & Actions",  "view_reasons"),
     ("tab_email",     "📧 Send Reminders",     "send_reminders"),
     ("tab_product",   "🧩 Product Classification", None),
+    ("tab_collections", "💰 Collection View - Monthly", None),
 ]
 _visible_defs = [(var, lbl) for var, lbl, perm in _TAB_DEFS if perm is None or _can(perm)]
 _tab_widgets  = st.tabs([lbl for _, lbl in _visible_defs])
@@ -3629,6 +3753,7 @@ tab_invoices = _tab_map.get("tab_invoices")   # None for management
 tab_reasons  = _tab_map.get("tab_reasons")    # None for management
 tab_email    = _tab_map.get("tab_email")      # None for viewer / csm / management
 tab_product  = _tab_map.get("tab_product")    # Product Studio/Vini classification
+tab_collections = _tab_map.get("tab_collections")  # Month-on-month collections
 
 # ─────────────────────────── TAB 1 · OVERVIEW ────────────────────────────────
 if tab_overview is not None:
@@ -5313,3 +5438,196 @@ if tab_product is not None:
                         column_config={
                             "Outstanding (₹)": st.column_config.NumberColumn(format="localized"),
                         })
+
+
+# ─────────────────── TAB · COLLECTION VIEW — MONTHLY ─────────────────────────
+if tab_collections is not None:
+    with tab_collections:
+        st.markdown("Month-on-month **collections** (from **Jan 2026**). Month = "
+                    "**(last payment date − 1 day)**, except **May & June use the actual date**. "
+                    "**Totals come from the base sheet** "
+                    "(collection = total − balance − credits, in INR). The **Studio / Vini "
+                    "split is estimated** from the product sheet's mix each month (it covers "
+                    "part of the invoices), so totals stay accurate while the split is indicative. "
+                    "Refreshes with the base data.")
+
+        _base = load_base_collections()
+        cpdf  = load_product_sheet()
+        if _base is None or _base.empty:
+            st.info("Base sheet collections could not be computed. Click 🔄 Refresh.")
+        else:
+            _MONTH_LBL = {"01": "Jan", "02": "Feb", "03": "Mar", "04": "Apr", "05": "May",
+                          "06": "Jun", "07": "Jul", "08": "Aug", "09": "Sep", "10": "Oct",
+                          "11": "Nov", "12": "Dec"}
+            def _mlabel(ym):
+                y, m = ym.split("-"); return f"{_MONTH_LBL.get(m, m)} {y}"
+            _CLASS_COLORS_C = {"Studio": "#3b82f6", "Vini": "#a855f7"}
+
+            _base = _base[_base["ym"] >= "2026-01"].copy()
+            _base_month = _base.groupby("ym")["coll_inr"].sum()   # accurate monthly totals
+
+            # Product-sheet split ratio per month (Studio vs Vini)
+            if cpdf is not None and not cpdf.empty and "collection_fc" in cpdf.columns:
+                _rate = cpdf["currency_code"].astype(str).str.upper().str.strip().map(_INR_RATES).fillna(0)
+                cpdf = cpdf.copy()
+                cpdf["Collection INR"] = pd.to_numeric(cpdf["collection_fc"], errors="coerce").fillna(0) * _rate
+                _prod = cpdf[(cpdf["pay_month"] >= "2026-01") & (cpdf["Collection INR"] > 0)]
+            else:
+                _prod = pd.DataFrame(columns=["pay_month", "Product Class", "Collection INR", "item_name"])
+            _pmc = (_prod.groupby(["pay_month", "Product Class"])["Collection INR"].sum()
+                          .unstack(fill_value=0)) if not _prod.empty else pd.DataFrame()
+            for _cc in ["Studio", "Vini"]:
+                if _cc not in _pmc.columns:
+                    _pmc[_cc] = 0
+            _pmc["_tot"] = _pmc.get("Studio", 0) + _pmc.get("Vini", 0)
+
+            # Allocate base monthly totals by the product split ratio
+            _rows = []
+            for ym in sorted(_base_month.index):
+                tot = float(_base_month[ym])
+                if ym in _pmc.index and _pmc.loc[ym, "_tot"] > 0:
+                    ss = _pmc.loc[ym, "Studio"] / _pmc.loc[ym, "_tot"]
+                    vs = _pmc.loc[ym, "Vini"]   / _pmc.loc[ym, "_tot"]
+                else:
+                    ss, vs = 1.0, 0.0
+                _rows.append({"ym": ym, "Month": _mlabel(ym),
+                              "Studio": tot * ss, "Vini": tot * vs, "Total": tot})
+            _alloc = pd.DataFrame(_rows)
+
+            # ── KPIs ──────────────────────────────────────────────────────────────
+            _tot_all = _base_month.sum()
+            _months  = list(_alloc["ym"])
+            _latest  = _months[-1]
+            _latest_val = float(_base_month[_latest])
+            _studio_share = (_alloc["Studio"].sum() / _tot_all * 100) if _tot_all else 0
+            kc = st.columns(4)
+            for _c, (_lbl, _val, _clr) in zip(kc, [
+                ("Total Collected (INR)", fmt_inr(_tot_all), "#1aa873"),
+                (f"{_mlabel(_latest)} Collected", fmt_inr(_latest_val), "#3b82f6"),
+                ("Studio Share (est.)", f"{_studio_share:.0f}%", "#3b82f6"),
+                ("Months", str(len(_months)), "#8b5cf6"),
+            ]):
+                _c.markdown(
+                    f"<div class='kpi-card'>"
+                    f"<div class='kpi-label' style='margin-top:0;margin-bottom:9px;'>{_lbl}</div>"
+                    f"<div class='kpi-value' style='color:{_clr};'>{_val}</div></div>",
+                    unsafe_allow_html=True)
+
+            st.divider()
+
+            # ── Month-on-month chart ──────────────────────────────────────────────
+            st.subheader("Monthly Collection by Product Class (INR)")
+            _long = _alloc.melt(id_vars=["Month"], value_vars=["Studio", "Vini"],
+                                var_name="Product Class", value_name="Collection INR")
+            fig_c = px.bar(_long, x="Month", y="Collection INR", color="Product Class",
+                           color_discrete_map=_CLASS_COLORS_C,
+                           category_orders={"Month": list(_alloc["Month"])},
+                           title="Collections month-on-month (totals from base sheet)", text_auto=".2s")
+            fig_c.update_layout(barmode="stack", xaxis_title="", yaxis_title="Collection (INR)",
+                                legend_title="Product Class")
+            st.plotly_chart(_fmt_fig(fig_c), use_container_width=True, theme=None)
+
+            # ── Monthly summary table ─────────────────────────────────────────────
+            st.subheader("Monthly Collection Summary")
+            _sum_show = _alloc[["Month", "Studio", "Vini", "Total"]].copy()
+            for _cc in ["Studio", "Vini", "Total"]:
+                _sum_show[_cc] = _sum_show[_cc].round(0).astype("int64")
+            _gt = {"Month": "Grand Total", "Studio": int(_sum_show["Studio"].sum()),
+                   "Vini": int(_sum_show["Vini"].sum()), "Total": int(_sum_show["Total"].sum())}
+            _sum_show = pd.concat([_sum_show, pd.DataFrame([_gt])], ignore_index=True)
+            st.dataframe(
+                _sum_show, use_container_width=True, hide_index=True,
+                column_config={
+                    "Studio": st.column_config.NumberColumn("Studio (₹, est.)", format="localized"),
+                    "Vini":   st.column_config.NumberColumn("Vini (₹, est.)", format="localized"),
+                    "Total":  st.column_config.NumberColumn("Total (₹)", format="localized"),
+                })
+            st.caption("Total = base sheet (accurate). Studio/Vini = estimated split "
+                       "from the product sheet's monthly mix.")
+
+            # ── Product-wise matrix (scaled to base totals) ───────────────────────
+            if not _prod.empty:
+                st.subheader("Product-wise Monthly Collection (INR, est.)")
+                _pim = _prod.pivot_table(index="item_name", columns="pay_month",
+                                         values="Collection INR", aggfunc="sum", fill_value=0)
+                # scale each month so the column sums to the base-sheet monthly total
+                for ym in _pim.columns:
+                    _colsum = _pim[ym].sum()
+                    _factor = (float(_base_month.get(ym, 0)) / _colsum) if _colsum else 0
+                    _pim[ym] = _pim[ym] * _factor
+                _pim = _pim[[c for c in sorted(_pim.columns)]]
+                _pim.columns = [_mlabel(c) for c in _pim.columns]
+                _pim["Total"] = _pim.sum(axis=1)
+                _pim = _pim.sort_values("Total", ascending=False).reset_index().rename(columns={"item_name": "Product"})
+                for _cc in _pim.columns:
+                    if _cc != "Product":
+                        _pim[_cc] = _pim[_cc].round(0).astype("int64")
+                st.dataframe(
+                    _pim, use_container_width=True, hide_index=True, height=440,
+                    column_config={c: st.column_config.NumberColumn(format="localized")
+                                   for c in _pim.columns if c != "Product"})
+                st.download_button(
+                    "⬇ Download Monthly Collections",
+                    data=export_excel(_pim),
+                    file_name="monthly_collections.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+
+            # ── Account-level collection detail ───────────────────────────────────
+            st.divider()
+            st.subheader("Account-Level Collection (INR)")
+            _all_months = sorted(_base["ym"].unique())
+            af1, af2 = st.columns([2, 2])
+            with af1:
+                _msel = st.multiselect("Months", [_mlabel(m) for m in _all_months],
+                                       default=[_mlabel(m) for m in _all_months], key="coll_acc_months")
+            with af2:
+                _aq = st.text_input("🔍 Search account / Enterprise ID",
+                                    placeholder="Type to filter…", key="coll_acc_q").strip()
+            _sel_ym = [m for m in _all_months if _mlabel(m) in _msel] or _all_months
+            _bf = _base[_base["ym"].isin(_sel_ym)].copy()
+
+            _agg = (_bf.groupby(["customer_name", "ent"])
+                       .agg(Invoices=("invoice_number", "nunique"), Total=("coll_inr", "sum"))
+                       .reset_index())
+            _mx = (_bf.pivot_table(index=["customer_name", "ent"], columns="ym",
+                                   values="coll_inr", aggfunc="sum", fill_value=0).reset_index())
+            _mcols = [_mlabel(c) for c in _mx.columns[2:]]
+            _mx.columns = ["customer_name", "ent"] + _mcols
+            _acc = _agg.merge(_mx, on=["customer_name", "ent"]).sort_values("Total", ascending=False)
+            _acc = _acc.rename(columns={"customer_name": "Customer", "ent": "Enterprise ID"})
+            if _aq:
+                _acc = _acc[_acc["Customer"].str.contains(_aq, case=False, na=False)
+                            | _acc["Enterprise ID"].astype(str).str.contains(_aq, case=False, na=False)]
+            _acc_cols = ["Customer", "Enterprise ID", "Invoices"] + _mcols + ["Total"]
+            _acc = _acc[_acc_cols]
+            for _c in _mcols + ["Total"]:
+                _acc[_c] = _acc[_c].round(0).astype("int64")
+            st.caption(f"{len(_acc)} accounts · total collected {fmt_inr(_acc['Total'].sum())}")
+            st.dataframe(
+                _acc, use_container_width=True, hide_index=True, height=460,
+                column_config={c: st.column_config.NumberColumn(format="localized")
+                               for c in _mcols + ["Total"]})
+            st.download_button(
+                "⬇ Download Account Collections",
+                data=export_excel(_acc),
+                file_name="account_collections.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+            # Drill-down: invoice-level collections for a chosen account
+            st.markdown("###### 🔎 Drill down to invoice level")
+            _sel_acc = st.selectbox("Select an account",
+                                    ["— select —"] + _acc["Customer"].tolist(),
+                                    key="coll_acc_drill", label_visibility="collapsed")
+            if _sel_acc and _sel_acc != "— select —":
+                _d = _bf[_bf["customer_name"] == _sel_acc].copy().sort_values("coll_inr", ascending=False)
+                _d["Month"] = _d["ym"].apply(_mlabel)
+                _d["Collection (₹)"] = _d["coll_inr"].round(0).astype("int64")
+                _dd = _d.rename(columns={"invoice_number": "Invoice No.", "pay_date": "Payment Date",
+                                         "cur": "Currency"})[["Invoice No.", "Payment Date",
+                                                              "Month", "Currency", "Collection (₹)"]]
+                st.markdown(f"**{_sel_acc}** — {len(_dd)} invoice(s) collected, "
+                            f"total {fmt_inr(_d['coll_inr'].sum())}")
+                st.dataframe(_dd, use_container_width=True, hide_index=True, height=360,
+                             column_config={"Collection (₹)": st.column_config.NumberColumn(format="localized")})
