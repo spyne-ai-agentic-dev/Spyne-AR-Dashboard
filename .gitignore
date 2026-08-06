@@ -15,3 +15,8 @@ __pycache__/
 
 # Data files
 sample_data.xlsx
+
+# Service-account keys & OS files — never commit
+*.json
+collections-and-revenue-*.json
+.DS_Store

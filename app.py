@@ -1746,19 +1746,90 @@ def _normalize_private_key(pk: str) -> str:
     return pk
 
 
-def _sentlog_ws():
-    """Return the gspread worksheet for the Sent Log tab, or None if not configured."""
+def _gspread_client():
+    """Return an authorized gspread client from the service-account secret, or None."""
     try:
         import gspread
         from google.oauth2.service_account import Credentials
         if "gcp_service_account" not in st.secrets:
             return None
-        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
         _sa = dict(st.secrets["gcp_service_account"])
         if _sa.get("private_key"):
             _sa["private_key"] = _normalize_private_key(_sa["private_key"])
-        creds = Credentials.from_service_account_info(_sa, scopes=scopes)
-        gc = gspread.authorize(creds)
+        creds = Credentials.from_service_account_info(_sa, scopes=[
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive.readonly",
+        ])
+        return gspread.authorize(creds)
+    except Exception:
+        return None
+
+
+def _sa_workbook_xlsx(sheet_id: str) -> bytes | None:
+    """Read every worksheet of a sheet via the service account and repackage as
+    xlsx bytes (so existing parsers work unchanged). Numbers are read UNFORMATTED
+    (so they stay numeric) and dates as their displayed string. None on failure."""
+    gc = _gspread_client()
+    if gc is None:
+        return None
+    try:
+        sh = gc.open_by_key(sheet_id)
+        buf = BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as w:
+            wrote = False
+            for ws in sh.worksheets():
+                try:
+                    vals = ws.get_all_values(value_render_option="UNFORMATTED_VALUE",
+                                             date_time_render_option="FORMATTED_STRING")
+                except Exception:
+                    vals = ws.get_all_values()   # older gspread / API fallback
+                if not vals or len(vals) < 1:
+                    continue
+                hdr, rows = vals[0], vals[1:]
+                # pad short rows to header width
+                rows = [r + [""] * (len(hdr) - len(r)) for r in rows]
+                pd.DataFrame(rows, columns=hdr).to_excel(
+                    w, sheet_name=str(ws.title)[:31], index=False)
+                wrote = True
+            if not wrote:
+                return None
+        return buf.getvalue()
+    except Exception:
+        return None
+
+
+def _public_workbook_xlsx(sheet_id: str) -> bytes | None:
+    try:
+        r = requests.get(
+            f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=xlsx",
+            timeout=45)
+        if r.status_code == 200 and r.content[:2] == b"PK":   # valid xlsx zip magic
+            return r.content
+    except Exception:
+        pass
+    return None
+
+
+def _sheet_xlsx_bytes(sheet_id: str) -> bytes:
+    """Workbook xlsx bytes for a sheet. Reads via the SERVICE ACCOUNT first (so it
+    works when the sheet is private), falling back to public export as a backup."""
+    b = _sa_workbook_xlsx(sheet_id)
+    if b is not None:
+        return b
+    b = _public_workbook_xlsx(sheet_id)
+    if b is not None:
+        return b
+    raise ConnectionError(
+        "Could not read the sheet via the service account or public export. "
+        "Ensure it is shared with the service-account email as Viewer.")
+
+
+def _sentlog_ws():
+    """Return the gspread worksheet for the Sent Log tab, or None if not configured."""
+    try:
+        gc = _gspread_client()
+        if gc is None:
+            return None
         sheet_id, _ = parse_gsheet_url(_FIXED_SHEET_URL)
         sh = gc.open_by_key(sheet_id)
         try:
@@ -2634,20 +2705,10 @@ def parse_gsheet_url(url: str):
 
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_gsheet(url: str) -> bytes:
-    """Download a Google Sheet as xlsx bytes (sheet must be publicly shared). Cached 2 min."""
-    sheet_id, gid = parse_gsheet_url(url)
-    export_url = (
-        f"https://docs.google.com/spreadsheets/d/{sheet_id}"
-        f"/export?format=xlsx&gid={gid}"
-    )
-    resp = requests.get(export_url, timeout=30)
-    if resp.status_code == 401:
-        raise PermissionError(
-            "Sheet is private. Share it as 'Anyone with the link can view' and try again."
-        )
-    if resp.status_code != 200:
-        raise ConnectionError(f"Google returned HTTP {resp.status_code}. Check the URL.")
-    return resp.content
+    """Workbook xlsx bytes for a Google Sheet. Uses public export when the sheet
+    is link-shared, else the service account (if the sheet is shared with it)."""
+    sheet_id, _ = parse_gsheet_url(url)
+    return _sheet_xlsx_bytes(sheet_id)
 
 
 # ── "Customer on Auto Pay" list ───────────────────────────────────────────────
@@ -2660,15 +2721,20 @@ def _norm_name(s) -> str:
 
 @st.cache_data(ttl=300, show_spinner=False)
 def load_autopay_customers() -> set:
-    """Return a set of normalized customer names on Auto Pay (from the dedicated sheet tab)."""
+    """Return normalized customer names on Auto Pay. Reads the auto-pay tab from
+    the base workbook (public export or service account)."""
     try:
         sheet_id, _ = parse_gsheet_url(_FIXED_SHEET_URL)
-        url = (f"https://docs.google.com/spreadsheets/d/{sheet_id}"
-               f"/export?format=csv&gid={_AUTOPAY_GID}")
-        df = pd.read_csv(BytesIO(requests.get(url, timeout=20).content))
-        name_col = next((c for c in df.columns if "customer" in c.lower() and "name" in c.lower()), None)
+        xl = pd.ExcelFile(BytesIO(_sheet_xlsx_bytes(sheet_id)))
+        # find the auto-pay tab by name (e.g. "Customer on Auto Pay" / "Customs on Auto-pay")
+        _tab = next((s for s in xl.sheet_names
+                     if "auto" in s.lower() and ("pay" in s.lower())), None)
+        if _tab is None:
+            return set()
+        df = xl.parse(_tab)
+        name_col = next((c for c in df.columns if "customer" in str(c).lower() and "name" in str(c).lower()), None)
         if name_col is None:
-            name_col = next((c for c in df.columns if "name" in c.lower()), df.columns[-1])
+            name_col = next((c for c in df.columns if "name" in str(c).lower()), df.columns[-1])
         return {_norm_name(v) for v in df[name_col].dropna() if _norm_name(v)}
     except Exception:
         return set()
@@ -2761,9 +2827,7 @@ def load_product_sheet() -> pd.DataFrame:
     """Load the product/line-item sheet, classify each line Studio/Vini, and
     compute aging + per-line RAG. Empty DataFrame on failure."""
     try:
-        url = (f"https://docs.google.com/spreadsheets/d/{_PRODUCT_SHEET_ID}"
-               f"/export?format=xlsx")
-        _xl = pd.ExcelFile(BytesIO(requests.get(url, timeout=40).content))
+        _xl = pd.ExcelFile(BytesIO(_sheet_xlsx_bytes(_PRODUCT_SHEET_ID)))
         # Prefer the "Combined Invoices" tab; else the best line-item-looking sheet
         _tab = next((s for s in _xl.sheet_names
                      if s.strip().lower() == _PRODUCT_TAB.lower()), None)
@@ -2873,10 +2937,14 @@ def load_base_collections() -> pd.DataFrame:
     if not need <= set(b.columns):
         return pd.DataFrame()
 
+    def _num_col(col):
+        return pd.to_numeric(
+            b[col].astype(str).str.replace(r"[,₹$€£\s]", "", regex=True),
+            errors="coerce").fillna(0)
     b["cur"] = b["currency_code"].astype(str).str.upper().str.strip()
-    b["tot"] = pd.to_numeric(b["total"], errors="coerce").fillna(0)
-    b["bal"] = pd.to_numeric(b["balance"], errors="coerce").fillna(0)
-    b["out"] = pd.to_numeric(b["Outstanding"], errors="coerce").fillna(0)
+    b["tot"] = _num_col("total")
+    b["bal"] = _num_col("balance")
+    b["out"] = _num_col("Outstanding")
     b["lpd"] = pd.to_datetime(b["last_payment_date"], errors="coerce", dayfirst=True)
 
     # INR rates implied by the base sheet
@@ -2890,7 +2958,7 @@ def load_base_collections() -> pd.DataFrame:
     # Credits — use the base sheet's own "Credits Applied" column (per invoice)
     _cred_col = next((c for c in b.columns if str(c).strip().lower() == "credits applied"), None)
     if _cred_col:
-        b["credit"] = pd.to_numeric(b[_cred_col], errors="coerce").fillna(0)
+        b["credit"] = _num_col(_cred_col)
     else:
         b["credit"] = 0
 
@@ -2980,6 +3048,31 @@ with st.sidebar:
             pass
         st.rerun()
     st.divider()
+
+    # ── Private-sheet (service-account) access test — admins only ─────────────
+    if _can("manage_users"):
+        with st.expander("🔐 Private-sheet access test", expanded=False):
+            st.caption("Confirms the service account can read the sheets — run this "
+                       "BEFORE turning off public link access.")
+            if st.button("🔎 Test service-account read", use_container_width=True):
+                _gc = _gspread_client()
+                if _gc is None:
+                    st.error("❌ Service account not configured (`gcp_service_account` secret missing).")
+                else:
+                    for _lbl, _sid in [("Base sheet", "1pY_hPKVa8A-d6kbCnsuRdns4CiuRTh1QaIJRf5-ppOI"),
+                                       ("Product sheet", _PRODUCT_SHEET_ID)]:
+                        _bts = _sa_workbook_xlsx(_sid)
+                        if _bts is None:
+                            st.error(f"❌ {_lbl}: cannot read via service account. "
+                                     f"Share it with the service-account email as Viewer.")
+                        else:
+                            try:
+                                _xlt = pd.ExcelFile(BytesIO(_bts))
+                                _rows = sum(len(_xlt.parse(s)) for s in _xlt.sheet_names)
+                                st.success(f"✅ {_lbl}: readable — {len(_xlt.sheet_names)} tab(s), ~{_rows:,} rows.")
+                            except Exception as _e:
+                                st.error(f"❌ {_lbl}: read but could not parse — {_e}")
+        st.divider()
 
     # ── Change Password (available to every logged-in user) ───────────────────
     with st.expander("🔒 Change Password", expanded=False):
