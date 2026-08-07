@@ -3301,7 +3301,8 @@ html, body, .stApp, [data-testid="stMarkdownContainer"] {{
     font-family: 'Manrope', -apple-system, BlinkMacSystemFont, sans-serif !important;
     color: var(--ar-text);
 }}
-.block-container {{ padding-top: 1.1rem; max-width: 1400px; }}
+.block-container {{ padding-top: 1.1rem; max-width: 100% !important;
+    padding-left: 2.5rem !important; padding-right: 2.5rem !important; }}
 
 /* base text colours (inline styles still win for coloured numbers) */
 .stApp p, .stApp li, .stApp label, .stApp .stMarkdown,
