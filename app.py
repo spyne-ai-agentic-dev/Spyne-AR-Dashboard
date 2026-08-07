@@ -881,7 +881,7 @@ def _login_page():
 </div>
 <div style="position:relative;z-index:3;display:flex;align-items:center;justify-content:space-between;padding:18px 44px;border-top:1px solid rgba(148,163,184,0.08);">
 <span style="font-size:12px;color:#64748b;">&copy; 2026 Spyne &middot; Enabling dealerships to sell cars faster.</span>
-<span style="font-size:12px;color:#475569;">Secured by Google OAuth &middot; SSO enforced</span>
+<span style="font-size:12px;color:#475569;">Secured by Google OAuth &middot; SSO enforced &middot; build 2026-08-07a</span>
 </div>
 </div>
 """, unsafe_allow_html=True)
