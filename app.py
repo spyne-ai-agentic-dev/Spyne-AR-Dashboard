@@ -371,10 +371,15 @@ import hmac as _hmac
 
 _SESSION_TTL_SECONDS = 7 * 24 * 3600  # 7 days
 
+# Bump this to force-logout EVERY persisted session (all existing tokens become
+# invalid on their next load, so everyone must sign in again).
+_SESSION_KEY_VERSION = "2026-08-07-forcelogout-1"
+
 def _session_secret() -> str:
-    """Stable signing key — reuse the OAuth client_secret (already secret & stable)."""
+    """Signing key — OAuth client_secret plus a rotatable version. Changing the
+    version invalidates all previously-issued session tokens (global logout)."""
     _, cs, _ = _get_google_cfg()
-    return cs or "ar-dashboard-fallback-secret"
+    return f"{cs or 'ar-dashboard-fallback-secret'}|{_SESSION_KEY_VERSION}"
 
 def _make_session_token(email: str, role: str, csm_name: str | None) -> str:
     payload = {
