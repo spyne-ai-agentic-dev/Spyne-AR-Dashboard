@@ -435,6 +435,7 @@ def _google_auth_url(client_id, redirect_uri):
         "scope": "openid email profile",
         "access_type": "online",
         "prompt": "select_account",
+        "hd": GOOGLE_AUTH_DOMAIN,   # restrict Google chooser to the @spyne.ai workspace
     }
     return _GOOGLE_AUTH_URL + "?" + _urlparse.urlencode(params)
 
