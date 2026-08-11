@@ -1,5 +1,38 @@
-node_modules
-.next
+# ── Secrets: never bake these into an image ──────────────────────────────────
+.streamlit/secrets.toml
+credentials.json
+*-*.json.key
+collections-and-revenue-*.json
+*.pem
+.env
+.env.*
+
+# ── Local state / data ───────────────────────────────────────────────────────
+reasons.db
+*.db
+*.xlsx
+*.csv
+
+# ── Python build artefacts ───────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+
+# ── Tooling / VCS / OS ───────────────────────────────────────────────────────
 .git
-.env*
-npm-debug.log*
+.gitignore
+.github
+.devcontainer
+.claude
+.DS_Store
+*.log
+
+# ── Docs & pipeline specs (not needed inside the image) ──────────────────────
+CLAUDE.md
+README.md
+code-build.yaml
+code-deploy.yaml
