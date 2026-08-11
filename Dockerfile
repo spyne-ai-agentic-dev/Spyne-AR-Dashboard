@@ -1,13 +1,9 @@
 # AR Collections Dashboard — Python/Streamlit service for ECS Fargate.
-# Runtime config is injected by ECS as APP_SECRETS; no ENV for runtime values.
+# The ALB routes the domain (spyne-ar-dashboard.spyne.ai) to this container and
+# health-checks GET /health. Runtime config arrives as APP_SECRETS from Secrets
+# Manager, so there is deliberately no ENV for runtime values here.
 
 FROM python:3.11-slim
-
-# nginx fronts Streamlit to serve the platform health-check path.
-# gettext-base provides envsubst for rendering the nginx config.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends nginx gettext-base \
-    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
@@ -23,8 +19,8 @@ COPY spyne_logo.png spyne-logo-dark.png ./
 COPY .streamlit/config.toml ./.streamlit/config.toml
 COPY docker/ ./docker/
 
-# Non-root runtime user; it needs to write the generated secrets file,
-# the SQLite cache, and nginx's temp/pid files (all under /app or /tmp).
+# Non-root runtime user. It needs to write the generated secrets file and the
+# local SQLite cache, both under /app.
 RUN useradd --system --uid 10001 --create-home appuser \
     && chmod +x /app/docker/entrypoint.sh \
     && mkdir -p /app/.streamlit \
@@ -32,6 +28,7 @@ RUN useradd --system --uid 10001 --create-home appuser \
 
 USER appuser
 
+# Informational: the real port comes from APP_SECRETS.PORT at runtime.
 EXPOSE 3000
 
 CMD ["/app/docker/entrypoint.sh"]
