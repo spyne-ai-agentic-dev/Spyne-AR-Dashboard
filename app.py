@@ -1149,7 +1149,11 @@ def build_email(template_key: str, customer: str, invoices_df: pd.DataFrame,
                            Service_period_Start_date, Service_period_End_date, Aging
     """
     n         = len(invoices_df)
-    max_aging = int(invoices_df["Aging"].max()) if "Aging" in invoices_df.columns else 0
+    # NaN-safe: an empty selection (or all-blank Aging) makes .max() NaN, and
+    # int(NaN) raises ValueError.
+    _aging_max = (pd.to_numeric(invoices_df["Aging"], errors="coerce").max()
+                  if "Aging" in invoices_df.columns else None)
+    max_aging = int(_aging_max) if pd.notna(_aging_max) else 0
     # Urgent & Final reminders show per-invoice aging in the table
     inv_table = _invoice_table_html(invoices_df, include_aging=template_key in ("urgent", "final"))
 
@@ -1245,9 +1249,12 @@ def build_email(template_key: str, customer: str, invoices_df: pd.DataFrame,
                                customer, body, custom_note, csm)
 
     else:  # subscription
-        inv_row = invoices_df.iloc[0]
+        # Empty selection would IndexError on .iloc[0]; fall back to blanks.
+        inv_row = invoices_df.iloc[0] if not invoices_df.empty else pd.Series(dtype=object)
         sym = CURR_SYM.get(str(inv_row.get("currency_code","")).upper(), "")
-        inv_amt = inv_row.get("total", inv_row.get("Final USD", 0))
+        inv_amt = pd.to_numeric(
+            pd.Series([inv_row.get("total", inv_row.get("Final USD", 0))]),
+            errors="coerce").fillna(0).iloc[0]
         subject = f"New Subscription Invoice – {customer} | {sym}{inv_amt:,.0f}"
         body = f"""
         <p style="color:#000000;font-size:15px;margin:0 0 16px;">
@@ -3805,7 +3812,9 @@ _ks_customers   = fdf["customer_name"].nunique() if "customer_name" in fdf.colum
 _ks_invoices    = len(fdf)
 _ks_overdue     = (fdf[fdf["RAG"] == "Red"]["Final USD"].sum()
                    if "RAG" in fdf.columns and "Final USD" in fdf.columns else 0)
-_ks_avg_aging   = int(fdf["Aging"].mean()) if "Aging" in fdf.columns and len(fdf) else 0
+_ks_avg_aging_raw = (pd.to_numeric(fdf["Aging"], errors="coerce").mean()
+                     if "Aging" in fdf.columns and len(fdf) else None)
+_ks_avg_aging   = int(_ks_avg_aging_raw) if pd.notna(_ks_avg_aging_raw) else 0
 
 # ── KPI ribbon — matches design (uppercase label, Space Grotesk coloured value) ─
 _kpi_data = [
@@ -4742,10 +4751,17 @@ if tab_email is not None:
                     with st.expander("👁 Preview email for first selected customer"):
                         r0        = cust_to_send.iloc[0]
                         cname0    = r0["customer_name"]
-                        _, phtml  = build_email(template_key, cname0,
-                                                cf[cf["customer_name"]==cname0],
-                                                r0.get("CSM",""), c_note)
-                        st.components.v1.html(phtml, height=600, scrolling=True)
+                        _pv_invs  = cf[cf["customer_name"] == cname0]
+                        if _pv_invs.empty:
+                            # Selection kept from a previous filter state — the
+                            # customer is no longer in the filtered data.
+                            st.info(f"**{cname0}** has no invoices under the current filters. "
+                                    "Clear or widen the filters above, or re-tick the customers "
+                                    "you want, to preview the email.")
+                        else:
+                            _, phtml = build_email(template_key, cname0, _pv_invs,
+                                                   r0.get("CSM",""), c_note)
+                            st.components.v1.html(phtml, height=600, scrolling=True)
 
                 st.divider()
 
@@ -4843,6 +4859,14 @@ if tab_email is not None:
                         customer_cc  = str(crow.get("Customer_CC", "")).strip()
                         cc_list      = _build_cc(csm_email, customer_cc)
                         cust_invs = cf_send[cf_send["customer_name"]==cname]
+                        if cust_invs.empty:
+                            # Stale tick from an earlier filter state — never send
+                            # a reminder with an empty invoice table.
+                            results.append({"Customer": cname,
+                                            "Status": "⚠️ Skipped — no invoices under current filters"})
+                            prog.progress((idx+1)/len(cust_to_send),
+                                          text=f"Sent {idx+1} of {len(cust_to_send)}…")
+                            continue
                         subject, html = build_email(template_key, cname, cust_invs,
                                                     crow.get("CSM",""), c_note)
 
