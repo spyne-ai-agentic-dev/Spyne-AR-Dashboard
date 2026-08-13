@@ -457,7 +457,7 @@ def _exchange_google_code(code, client_id, client_secret, redirect_uri):
     return info  # {email, name, picture, ...}
 
 _EMAIL_ROLES_PATH = os.path.join(os.path.dirname(__file__), "email_roles.json")
-_GITHUB_REPO      = "yashgoyal-sys/Spyne-AR-Dashboard"
+_GITHUB_REPO = "spyne-ai-agentic-dev/Spyne-AR-Dashboard"
 _EMAIL_ROLES_FILE = "email_roles.json"
 
 def _load_email_roles_file() -> dict:
